@@ -1,0 +1,231 @@
+import tkinter as tk
+from tkinter import messagebox, ttk, simpledialog
+import scapy.all as scapy
+import nmap
+import threading
+import sqlite3
+from datetime import datetime
+from pysnmp.hlapi import *
+import socket
+
+class NetworkScannerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Network Scanner")
+
+        self.label_network_range = ttk.Label(root, text="Enter Network Range:")
+        self.label_network_range.pack(pady=10)
+
+        self.network_entry = ttk.Entry(root, width=30)
+        self.network_entry.pack(pady=5)
+        
+        self.label_oid = ttk.Label(root, text="Select OID data to gather:")
+        self.label_oid.pack(pady=10)
+        
+        # OID selection Listbox 
+        self.oid_listbox = tk.Listbox(root, selectmode='multiple', width=30, height=10)
+        self.oid_listbox.pack(pady=5)
+        # OIDs list
+        self.oids = {'sysName': '1.3.6.1.2.1.1.5',
+                    'sysDescr': '1.3.6.1.2.1.1.1',
+                    'sysUpTime': '1.3.6.1.2.1.1.3',
+                    'sysLocation': '1.3.6.1.2.1.1.6',
+                    'sysServices': '1.3.6.1.2.1.1.7'
+                     }
+        for name, oid in self.oids.items():
+            self.oid_listbox.insert(tk.END, name)
+
+        self.scan_button = ttk.Button(root, text="Scan", command=self.scan)
+        self.scan_button.pack(pady=5)
+
+        self.progress_bar = ttk.Progressbar(root, orient="horizontal", length=200, mode="determinate")
+        self.progress_bar.pack(pady=5)
+
+        self.results_text = tk.Text(root, height=15, width=50)
+        self.results_text.pack(pady=10)
+
+        self.db_connection = sqlite3.connect("network_traffic.db")
+        self.create_table()
+
+        self.view_db_button = ttk.Button(root, text="View Database", command=self.view_database)
+        self.view_db_button.pack(pady=5)
+
+    def create_table(self):
+        cursor = self.db_connection.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS traffic_logs 
+                          (id INTEGER PRIMARY KEY, 
+                          timestamp TEXT, 
+                          source_ip TEXT, 
+                          destination_ip TEXT, 
+                          protocol TEXT, 
+                          length INTEGER)''')
+        self.db_connection.commit()
+
+    def save_to_db(self, packet, db_connection):
+        PROTOCOL_NUMBERS = {
+            0: 'HOPOPTS', 1: 'ICMP', 2: 'IGMP', 3: 'GGP', 4: 'IPIP', 6: 'TCP', 8: 'EGP', 12: 'PUP', 17: 'UDP', 22: 'IDP', 29: 'TP', 36: 'XTP',
+            41: 'IPV6', 43: 'ROUTING', 44: 'FRAGMENT', 46: 'RSVP', 47: 'GRE', 50: 'ESP', 51: 'AH', 58: 'ICMPV6', 59: 'NONE', 60: 'DSTOPTS',
+            63: 'HELLO', 77: 'ND', 80: 'EON', 103: 'PIM', 108: 'IPCOMP', 132: 'SCTP', 255: 'RAW', 256: 'MAX'
+        }
+        
+        cursor = db_connection.cursor()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        source_ip = packet[scapy.IP].src
+        destination_ip = packet[scapy.IP].dst
+        protocol_number = packet[scapy.IP].proto
+        protocol_name = PROTOCOL_NUMBERS.get(protocol_number, 'Unknown')
+        length = len(packet)
+        cursor.execute('''INSERT INTO traffic_logs 
+                        (timestamp, source_ip, destination_ip, protocol, length) 
+                        VALUES (?, ?, ?, ?, ?)''', (timestamp, source_ip, destination_ip, protocol_name, length))
+        db_connection.commit()
+
+    
+    def get_snmp_data(self, ip_address):
+        # Gather selected OIDs from the Listbox
+        selected_indices = self.oid_listbox.curselection()
+        selected_oids = [self.oid_listbox.get(i) for i in selected_indices]
+        
+        snmp_results = []
+        for name in selected_oids:
+            oid = self.oids.get(name)
+            # Define the SNMP parameters
+            community = 'public'  # SNMP community string
+
+            # Create an SNMP GET request for each selected OID
+            snmp_get = getCmd(SnmpEngine(),
+                              CommunityData(community),
+                              UdpTransportTarget((ip_address, 161)),
+                              ContextData(),
+                              ObjectType(ObjectIdentity(oid)))
+
+            # Execute the SNMP GET request
+            error_indication, error_status, error_index, var_binds = next(snmp_get)
+
+            # Check for errors and append results
+            if not error_indication and not error_status:
+                for var_bind in var_binds:
+                    snmp_results.append(f"Name: {self.name}, {var_bind[0]} = {var_bind[1]}")
+            else:
+                snmp_results.append(f"Error: {error_indication or 'Status not OK'}")
+
+        return snmp_results
+    
+    def scan(self):
+        self.results_text.delete(1.0, tk.END)
+        network_range = self.network_entry.get()
+        if not network_range:
+            messagebox.showerror("Error", "Please enter a network range.")
+            return
+
+        self.scan_button.config(state="disabled")
+        self.progress_bar.start()
+
+        def packet_callback(self, packet):
+            try:
+                if scapy.IP in packet:
+                    # Create a new database connection within the packet callback function
+                    with sqlite3.connect("network_traffic.db") as db_connection:
+                        self.save_to_db(packet, db_connection)
+            except Exception as e:
+                print(f"Error capturing packet: {e}")
+
+        def start_sniffing():
+            scapy.sniff(prn=lambda packet: packet_callback(self, packet), store=0, timeout=60)  # Sniff for 60 seconds
+
+        threading.Thread(target=start_sniffing).start()
+
+        def scan_wifi():
+            arp_request = scapy.ARP(pdst=network_range)
+            broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+            arp_request_broadcast = broadcast/arp_request
+            answered_list = scapy.srp(arp_request_broadcast, timeout=1, verbose=False)[0]
+            
+            devices = []
+            snmp_data = []
+            for element in answered_list:
+                device = {"ip": element[1].psrc, "mac": element[1].hwsrc}
+                devices.append(device)
+            return devices
+
+        def get_device_info(ip):
+            nm = nmap.PortScanner()
+            nm.scan(hosts=ip, arguments='-O')
+            device_info = {}
+            try:
+                device_info['hostname'] = nm[ip]['hostnames'][0]['name']
+            except IndexError:
+                device_info['hostname'] = 'Unknown'
+            device_info['mac'] = nm[ip]['addresses']['mac']
+            device_info['vendor'] = nm[ip]['vendor'][device_info['mac']]
+            try:
+                device_info['os'] = nm[ip]['osmatch'][0]['osclass'][0]['osfamily']
+            except IndexError:
+                device_info['os'] = 'Unknown'
+            return device_info
+
+        def update_results(devices):
+            snmp_data = []
+            for device in devices:
+                device_info = get_device_info(device['ip'])
+                self.results_text.insert(tk.END, f"IP: {device['ip']}, MAC: {device['mac']}\n")
+                self.results_text.insert(tk.END, f"\tHostname: {device_info['hostname']}\n")
+                self.results_text.insert(tk.END, f"\tMAC Vendor: {device_info['vendor']}\n")
+                self.results_text.insert(tk.END, f"\tOS: {device_info['os']}\n\n")
+                snmp = self.get_snmp_data(device['ip'])
+                snmp_data.append(snmp)
+                open_ports = scan_open_ports(device['ip'], '1-1024')
+                print(open_ports)
+                print(snmp_data)
+            self.scan_button.config(state="normal")
+            self.progress_bar.stop()
+
+        threading.Thread(target=update_results, args=(scan_wifi(),)).start()
+        
+        def scan_open_ports(target, ports="1-1024"):
+            nm = nmap.PortScanner()
+    
+            # Scanning the target
+            nm.scan(target, ports)
+            
+            # Collecting open ports and additional info
+            scan_results = {}
+            for host in nm.all_hosts():
+                print(f"Host : {host} ({nm[host].hostname()})")
+                print(f"State : {nm[host].state()}")
+                for proto in nm[host].all_protocols():
+                    print(f"----------\nProtocol : {proto}")
+                    lport = nm[host][proto].keys()
+                    for port in lport:
+                        print(f"port : {port}\tstate : {nm[host][proto][port]['state']}")
+                        scan_results[port] = nm[host][proto][port]
+            
+            return scan_results
+            
+            
+    def view_database(self):
+        db_window = tk.Toplevel(self.root)
+        db_window.title("Database Contents")
+
+        db_text = tk.Text(db_window, height=20, width=80)
+        db_text.pack(padx=10, pady=10)
+
+        cursor = self.db_connection.cursor()
+        cursor.execute("SELECT * FROM traffic_logs")
+        rows = cursor.fetchall()
+
+        for row in rows:
+            db_text.insert(tk.END, f"ID: {row[0]}\n")
+            db_text.insert(tk.END, f"Timestamp: {row[1]}\n")
+            db_text.insert(tk.END, f"Source IP: {row[2]}\n")
+            db_text.insert(tk.END, f"Destination IP: {row[3]}\n")
+            db_text.insert(tk.END, f"Protocol: {row[4]}\n")
+            db_text.insert(tk.END, f"Length: {row[5]}\n\n")
+
+def main():
+    root = tk.Tk()
+    app = NetworkScannerApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
